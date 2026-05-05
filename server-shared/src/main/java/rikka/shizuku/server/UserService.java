@@ -69,16 +69,49 @@ public class UserService {
                             ? UserHandleHidden.of(userId)
                             : new UserHandleHidden(userId));
             Context context = Refine.<ContextHidden>unsafeCast(systemContext).createPackageContextAsUser(pkg, Context.CONTEXT_INCLUDE_CODE | Context.CONTEXT_IGNORE_SECURITY, userHandle);
-            Field mPackageInfo = context.getClass().getDeclaredField("mPackageInfo");
-            mPackageInfo.setAccessible(true);
-            Object loadedApk = mPackageInfo.get(context);
-            Method makeApplication = loadedApk.getClass().getDeclaredMethod("makeApplication", boolean.class, Instrumentation.class);
-            Application application = (Application) makeApplication.invoke(loadedApk, true, null);
-            Field mInitialApplication = activityThread.getClass().getDeclaredField("mInitialApplication");
-            mInitialApplication.setAccessible(true);
-            mInitialApplication.set(activityThread, application);
-
-            ClassLoader classLoader = application.getClassLoader();
+            
+            Application application = null;
+            ClassLoader classLoader = null;
+            
+            // Try to create Application instance with graceful fallback
+            try {
+                Field mPackageInfo = context.getClass().getDeclaredField("mPackageInfo");
+                mPackageInfo.setAccessible(true);
+                Object loadedApk = mPackageInfo.get(context);
+                Method makeApplication = loadedApk.getClass().getDeclaredMethod("makeApplication", boolean.class, Instrumentation.class);
+                
+                try {
+                    // First attempt: try with a minimal Instrumentation instance
+                    Instrumentation instrumentation = new Instrumentation();
+                    application = (Application) makeApplication.invoke(loadedApk, true, instrumentation);
+                } catch (Exception e1) {
+                    // Fallback: try with null Instrumentation
+                    try {
+                        application = (Application) makeApplication.invoke(loadedApk, true, null);
+                    } catch (Exception e2) {
+                        // If both fail, log and fall back to using Context
+                        Log.w(TAG, "Failed to create Application instance, falling back to Context", e2);
+                        application = null;
+                    }
+                }
+                
+                if (application != null) {
+                    // Successfully created Application, set it as the initial application
+                    Field mInitialApplication = activityThread.getClass().getDeclaredField("mInitialApplication");
+                    mInitialApplication.setAccessible(true);
+                    mInitialApplication.set(activityThread, application);
+                    classLoader = application.getClassLoader();
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Error during Application initialization", e);
+                application = null;
+            }
+            
+            // If Application creation failed, fall back to Context
+            if (application == null) {
+                classLoader = context.getClassLoader();
+            }
+            
             Class<?> serviceClass = classLoader.loadClass(cls);
             Constructor<?> constructorWithContext = null;
             try {
@@ -86,7 +119,8 @@ public class UserService {
             } catch (NoSuchMethodException | SecurityException ignored) {
             }
             if (constructorWithContext != null) {
-                service = (IBinder) constructorWithContext.newInstance(application);
+                // Pass Application if available, otherwise pass Context
+                service = (IBinder) constructorWithContext.newInstance(application != null ? application : context);
             } else {
                 service = (IBinder) serviceClass.newInstance();
             }
